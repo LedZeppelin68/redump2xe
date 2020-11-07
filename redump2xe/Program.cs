@@ -30,6 +30,9 @@ namespace redump2xe
                 string[] indexes = cuesheet.Where(x => x.Contains("INDEX 01")).Select(x => Regex.Match(x, "[0-9]{2}:[0-9]{2}:[0-9]{2}").Value).ToArray();
                 string[] tracks = cuesheet.Where(x => x.Contains("TRACK")).Select(x => Regex.Match(x, "(?<=(TRACK [0-9]{2} )).*").Value).ToArray();
 
+                MemoryStream full_subchannel = GenerateFullSubchannel(dir, files, indexes, tracks);
+                BinaryReader subr = new BinaryReader(full_subchannel);
+
                 BinaryWriter bw = new BinaryWriter(new FileStream(xe_file, FileMode.Create));
 
                 WriteXeHeader(bw, dir, files, indexes, tracks);
@@ -37,11 +40,15 @@ namespace redump2xe
                 //pregap gen
                 GeneratePreGap(bw, cuesheet);
 
+                int msf_absolute = 150;
+
                 for (int i = 0; i < files.Length; i++)
                 {
                     string file = Path.Combine(dir, files[i]);
 
                     BinaryReader br = new BinaryReader(new FileStream(file, FileMode.Open));
+
+                    int msf_relative = 0;
 
                     while (br.BaseStream.Position != br.BaseStream.Length)
                     {
@@ -49,14 +56,147 @@ namespace redump2xe
                         bw.Write(temp);
 
                         //dummy subchannel gen
-                        bw.Write(new byte[96]);
+                        //byte[] subchannel = GenerateSub(msf_relative, msf_absolute, (byte)(i + 1), 1);
+
+                        byte[] subchannel = TransSubchannel(subr.ReadBytes(96));
+
+
+                        bw.Write(subchannel);
+
+                        msf_relative++;
+                        msf_absolute++;
                     }
 
                     br.Close();
                 }
 
                 bw.Close();
+                subr.Close();
             }
+        }
+
+        private static byte[] TransSubchannel(byte[] subchannel)
+        {
+            byte[] subchannel_trans = new byte[96];
+
+            for (int k = 0; k < 8; k++)
+            {
+                for (int i = 0; i < 12; i++)
+                {
+                    for (int j = 0; j < 8; j++)
+                    {
+                        subchannel_trans[(7 - j) + i * 8] |= (byte)(((subchannel[i + k * 12] & (1 << j)) >> j) << 7 - k);
+                    }
+                }
+            }
+
+            return subchannel_trans;
+        }
+
+        private static MemoryStream GenerateFullSubchannel(string dir, string[] files, string[] indexes, string[] tracks)
+        {
+            MemoryStream sub_mem = new MemoryStream();
+            BinaryWriter bw = new BinaryWriter(sub_mem);
+
+            int msf_relative = 0;
+            int msf_absolute = 150;
+
+            for (int i = 0; i < files.Length; i++)
+            {
+                string file = Path.Combine(dir, files[i]);
+                long file_length = new FileInfo(file).Length / 2352;
+
+                int gap = MSF2LBA(indexes[i]);
+
+                byte track_n = LBA2MSF.MSFTable[i + 1];
+                byte track_type = TrackType(tracks[i]);
+
+                msf_relative = gap;
+
+                for (int j = 0; j < gap; j++)
+                {
+                    byte[] subchannel_gap = new byte[96];
+
+                    for (int k = 0; k < 12; k++)
+                    {
+                        subchannel_gap[k] = 0xff;
+                    }
+
+                    subchannel_gap[12 + 0] = track_type;
+                    subchannel_gap[12 + 1] = track_n;
+                    subchannel_gap[12 + 2] = 0;
+
+                    subchannel_gap[12 + 3] = LBA2MSF.M(msf_relative);
+                    subchannel_gap[12 + 4] = LBA2MSF.S(msf_relative);
+                    subchannel_gap[12 + 5] = LBA2MSF.F(msf_relative);
+                    subchannel_gap[12 + 6] = 0;
+
+                    subchannel_gap[12 + 7] = LBA2MSF.M(msf_absolute);
+                    subchannel_gap[12 + 8] = LBA2MSF.S(msf_absolute);
+                    subchannel_gap[12 + 9] = LBA2MSF.F(msf_absolute);
+
+                    byte[] crc = BitConverter.GetBytes(CRC.CalculateCRC16(subchannel_gap, 12, 10));
+
+                    subchannel_gap[12 + 10] = crc[1];
+                    subchannel_gap[12 + 11] = crc[0];
+
+                    msf_relative--;
+                    msf_absolute++;
+
+                    bw.Write(subchannel_gap);
+                }
+
+                msf_relative = 0;
+
+                for (int j = 0; j < file_length - gap; j++)
+                {
+                    byte[] subchannel = new byte[96];
+
+                    if (msf_relative == 0)
+                    {
+                        for (int k = 0; k < 12; k++)
+                        {
+                            subchannel[k] = 0xff;
+                        }
+                    }
+
+                    subchannel[12 + 0] = track_type;
+                    subchannel[12 + 1] = track_n;
+                    subchannel[12 + 2] = 1;
+
+                    subchannel[12 + 3] = LBA2MSF.M(msf_relative);
+                    subchannel[12 + 4] = LBA2MSF.S(msf_relative);
+                    subchannel[12 + 5] = LBA2MSF.F(msf_relative);
+                    subchannel[12 + 6] = 0;
+
+                    subchannel[12 + 7] = LBA2MSF.M(msf_absolute);
+                    subchannel[12 + 8] = LBA2MSF.S(msf_absolute);
+                    subchannel[12 + 9] = LBA2MSF.F(msf_absolute);
+
+                    byte[] crc = BitConverter.GetBytes(CRC.CalculateCRC16(subchannel, 12, 10));
+
+                    subchannel[12 + 10] = crc[1];
+                    subchannel[12 + 11] = crc[0];
+
+                    msf_relative++;
+                    msf_absolute++;
+
+                    bw.Write(subchannel);
+                }
+
+
+            }
+            sub_mem.Position = 0;
+            return sub_mem;
+        }
+
+        private static int MSF2LBA(string index)
+        {
+            string[] MSF = Regex.Split(index, ":");
+            int temp = Convert.ToInt32(MSF[0]) * 4500;
+            temp += Convert.ToInt32(MSF[1]) * 75;
+            temp += Convert.ToInt32(MSF[2]);
+            return temp;
         }
 
         private static void GeneratePreGap(BinaryWriter bw, string[] cuesheet)
@@ -105,6 +245,14 @@ namespace redump2xe
             byte[] subchannel = new byte[96];
             byte[] trans_subchannel = new byte[96];
 
+            if (msf_relative == 0 && index == 1)
+            {
+                for (int i = 0; i < 12; i++)
+                {
+                    subchannel[i] = 0xff;
+                }
+            }
+
             subchannel[12 + 0] = 0x41;
             subchannel[12 + 1] = track_n;
             subchannel[12 + 2] = index;
@@ -136,6 +284,8 @@ namespace redump2xe
 
             return trans_subchannel;
         }
+
+
 
         private static void WriteXeHeader(BinaryWriter bw, string dir, string[] files, string[] indexes, string[] tracks)
         {
@@ -406,7 +556,7 @@ namespace redump2xe
 
     internal class LBA2MSF
     {
-        static readonly byte[] MSFTable = {
+        internal static readonly byte[] MSFTable = {
             0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09,
             0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19,
             0x20, 0x21, 0x22, 0x23, 0x24, 0x25, 0x26, 0x27, 0x28, 0x29,
